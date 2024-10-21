@@ -8,7 +8,11 @@
 bool IS_ARM = false;
 bool USE_QIS_SIGNATURE = false;
 
-std::vector<uint8_t> FILE_BUFFER = {};
+using buffer_t = std::vector<uint8_t>;
+using seg_t = std::tuple<ea_t, size_t, buffer_t>;
+using segs_t = std::vector<seg_t>;
+
+segs_t SEGMENTS;
 
 static bool IsARM( ) {
 	return std::string_view( "ARM" ) == inf_get_procname().c_str();
@@ -78,100 +82,99 @@ static bool GetOperand( const insn_t& instruction, uint8_t* operandOffset, uint8
 	return false;
 }
 
-// Credit: belmeopmenieuwesim @ https://github.com/belmeopmenieuwesim/IDA-Pro-SigMaker/blob/697bebd3ecd71cb8af21ab10fb5006af8676252f/IDA%20Pro%20SigMaker/Main.cpp#L204C1-L227C52
-static std::vector<uint8_t> ReadSegmentsToBuffer( ) {
-	std::vector<uint8_t> buffer;
+static segs_t read_segments()
+{
+	segs_t segments;
 
-	// Iterate over all segments
-	for( int i = 0; i < get_segm_qty( ); ++i ) {
-		auto seg = getnseg( i );
-		if( !seg ) {
+	for (int i = 0; i < get_segm_qty(); ++i)
+	{
+		auto seg = getnseg(i);
+		if (!seg)
 			continue;
-		}
 
-		auto ea = buffer.empty( ) ? inf_get_min_ea( ) : seg->start_ea;
+		auto ea = segments.empty() ? inf_get_min_ea() : seg->start_ea;
 		size_t size = seg->end_ea - ea;
 
-		// Resize the buffer to accommodate the segment data
-		auto current_size = buffer.size( );
-		buffer.resize( current_size + size );
-
-		// Read the segment data into the buffer
-		get_bytes( &buffer[current_size], size, ea );
+		buffer_t buffer;
+		buffer.resize(size);
+		get_bytes(&buffer[0], size, ea);
+		
+		segments.push_back({ ea, size, std::move(buffer) });
 	}
 
-	return buffer;
+	return segments;
 }
 
-static std::string IdaToQisSignatureStr( std::string_view idaSignature ) {
+static std::string IdaToQisSignatureStr(std::string_view idaSignature)
+{
 	// Qis signature uses double quotes
 	return std::regex_replace( idaSignature.data( ), std::regex( "\\?" ), "??" );
 }
 
-static std::vector<ea_t> FindSignatureOccurencesQis( std::string_view idaSignature, bool skipMoreThanOne = false ) {
-
-	// Load file into our own buffer, since we can't get a direct pointer
-	if( FILE_BUFFER.empty( ) ) {
-		show_wait_box( "Please stand by, copying segments..." );
-		FILE_BUFFER = ReadSegmentsToBuffer( );
-		hide_wait_box( );
+static std::vector<ea_t> FindSignatureOccurencesQis(std::string_view ida_sig, bool skipMoreThanOne = false)
+{
+	if(SEGMENTS.empty())
+	{
+		show_wait_box("Please stand by, copying segments...");
+		SEGMENTS = read_segments();
+		hide_wait_box();
 	}
 
-	// Create qis signature from signature string
-	const qis::signature qisSignature( IdaToQisSignatureStr( idaSignature ) );
+	const qis::signature sig(IdaToQisSignatureStr(ida_sig));
 
-	// Search for occurences
 	std::vector<ea_t> results;
-	auto currentPtr = FILE_BUFFER.data( );
-	while( true ) {
-		auto occurence = qis::scan( currentPtr, FILE_BUFFER.size( ) - ( currentPtr - FILE_BUFFER.data( ) ), qisSignature );
 
-		// Signature not found anymore
-		if( occurence == qis::npos ) {
-			break;
+	for (const auto & [ea, size, buffer] : SEGMENTS)
+	{
+		const auto * beg = &buffer[0];
+		const auto * end = beg + size;
+		auto * ptr = beg;
+
+		while (ptr < end)
+		{
+			auto pos = qis::scan(ptr, end - ptr, sig);
+			if (pos == qis::npos)
+				break;
+
+			if (skipMoreThanOne && results.size() > 1)
+				break;
+
+			results.push_back(ea + (ptr - beg) + pos);
+
+			ptr += pos + 1;
 		}
-
-		//  In case we only care about uniqueness, return after more than one result
-		if( skipMoreThanOne && results.size( ) > 1 ) {
-			break;
-		}
-
-		auto fileOffset = ( ( currentPtr - FILE_BUFFER.data( ) ) + occurence );
-
-		results.push_back( inf_get_min_ea( ) + fileOffset );
-
-		currentPtr = FILE_BUFFER.data( ) + fileOffset + 1;
 	}
+
 	return results;
 }
 
-static std::vector<ea_t> FindSignatureOccurences( std::string_view idaSignature, bool skipMoreThanOne = false ) {
+static std::vector<ea_t> FindSignatureOccurences(std::string_view idaSignature, bool skipMoreThanOne = false)
+{
 
-	if( USE_QIS_SIGNATURE ) {
-		return FindSignatureOccurencesQis( idaSignature, skipMoreThanOne );
-	}
+	if (USE_QIS_SIGNATURE)
+		return FindSignatureOccurencesQis(idaSignature, skipMoreThanOne);
 
 	// Convert signature string to searchable struct
 	compiled_binpat_vec_t binaryPattern;
-	parse_binpat_str( &binaryPattern, inf_get_min_ea(), idaSignature.data( ), 16 );
+	parse_binpat_str(&binaryPattern, inf_get_min_ea(), idaSignature.data(), 16);
 
 	// Search for occurences
 	std::vector<ea_t> results;
 	auto ea = inf_get_min_ea();
-	while( true ) {
-		auto occurence = bin_search( ea, inf_get_max_ea(), binaryPattern, BIN_SEARCH_NOCASE | BIN_SEARCH_FORWARD );
+
+	while (true)
+	{
+		auto occurence = bin_search(ea, inf_get_max_ea(), binaryPattern, BIN_SEARCH_NOCASE | BIN_SEARCH_FORWARD);
 
 		// Signature not found anymore
-		if( occurence == BADADDR ) {
+		if (occurence == BADADDR)
 			break;
-		}
 
 		//  In case we only care about uniqueness, return after more than one result
-		if( skipMoreThanOne && results.size( ) > 1 ) {
+		if (skipMoreThanOne && results.size() > 1)
 			break;
-		}
 
-		results.push_back( occurence );
+		results.push_back(occurence);
 
 		ea = occurence + 1;
 	}
